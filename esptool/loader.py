@@ -3,10 +3,10 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-import base64
+from __future__ import division, print_function
+
 import hashlib
 import itertools
-import json
 import os
 import re
 import string
@@ -16,6 +16,14 @@ import time
 
 from .util import FatalError, NotImplementedInROMError, UnsupportedCommandError
 from .util import byte, hexify, mask_to_shift, pad_to
+
+import fcntl
+import termios
+
+TIOCMSET = getattr(termios, 'TIOCMSET', 0x5418)
+TIOCMGET = getattr(termios, 'TIOCMGET', 0x5415)
+TIOCM_DTR = getattr(termios, 'TIOCM_DTR', 0x002)
+TIOCM_RTS = getattr(termios, 'TIOCM_RTS', 0x004)
 
 try:
     import serial
@@ -73,15 +81,6 @@ ERASE_WRITE_TIMEOUT_PER_MB = 40  # timeout (per megabyte) for erasing and writin
 MEM_END_ROM_TIMEOUT = 0.05  # short timeout for ESP_MEM_END, as it may never respond
 DEFAULT_SERIAL_WRITE_TIMEOUT = 10  # timeout for serial port write
 DEFAULT_CONNECT_ATTEMPTS = 7  # default number of times to try connection
-WRITE_BLOCK_ATTEMPTS = 3  # number of times to try writing a data block
-
-STUBS_DIR = os.path.join(os.path.dirname(__file__), "./targets/stub_flasher/")
-
-
-def get_stub_json_path(chip_name):
-    chip_name = re.sub(r"[-()]", "", chip_name.lower())
-    chip_name = chip_name.replace("esp", "")
-    return STUBS_DIR + "stub_flasher_" + chip_name + ".json"
 
 
 def timeout_per_mb(seconds_per_mb, size_bytes):
@@ -132,21 +131,11 @@ def esp32s3_or_newer_function_only(func):
     )
 
 
-class StubFlasher:
-    def __init__(self, json_path):
-        with open(json_path) as json_file:
-            stub = json.load(json_file)
-
-        self.text = base64.b64decode(stub["text"])
-        self.text_start = stub["text_start"]
-        self.entry = stub["entry"]
-
-        try:
-            self.data = base64.b64decode(stub["data"])
-            self.data_start = stub["data_start"]
-        except KeyError:
-            self.data = None
-            self.data_start = None
+# Provide a 'basestring' class on Python 3
+try:
+    basestring
+except NameError:
+    basestring = str
 
 
 class ESPLoader(object):
@@ -268,11 +257,8 @@ class ESPLoader(object):
         # True if esptool detects conditions which require the stub to be disabled
         self.stub_is_disabled = False
 
-        if isinstance(port, str):
-            try:
-                self._port = serial.serial_for_url(port)
-            except serial.serialutil.SerialException:
-                raise FatalError(f"Could not open {port}, the port doesn't exist")
+        if isinstance(port, basestring):
+            self._port = serial.serial_for_url(port)
         else:
             self._port = port
         self._slip_reader = slip_reader(self._port, self.trace)
@@ -333,7 +319,10 @@ class ESPLoader(object):
     def checksum(data, state=ESP_CHECKSUM_MAGIC):
         """Calculate checksum of a blob, as it is defined by the ROM"""
         for b in data:
-            state ^= b
+            if type(b) is int:  # python 2/3 compat
+                state ^= b
+            else:
+                state ^= ord(b)
 
         return state
 
@@ -456,6 +445,18 @@ class ESPLoader(object):
         # request is sent with the updated RTS state and the same DTR state
         self._port.setDTR(self._port.dtr)
 
+    def _setDTRAndRTS(self, dtr = False, rts = False):
+         status = struct.unpack('I', fcntl.ioctl(self._port.fileno(), TIOCMGET, struct.pack('I', 0)))[0]
+         if dtr:
+             status |= TIOCM_DTR
+         else:
+             status &= ~TIOCM_DTR
+         if rts:
+             status |= TIOCM_RTS
+         else:
+             status &= ~TIOCM_RTS
+         fcntl.ioctl(self._port.fileno(), TIOCMSET, struct.pack('I', status))
+
     def _get_pid(self):
         if list_ports is None:
             print(
@@ -528,13 +529,13 @@ class ESPLoader(object):
                 7 if fpga_delay else 0.5 if extra_delay else 0.05
             )  # 0.5 needed for ESP32 rev0 and rev1
 
-            self._setDTR(False)  # IO0=HIGH
-            self._setRTS(True)  # EN=LOW, chip in reset
+            self._setDTRAndRTS(False, False)
+            self._setDTRAndRTS(True, True)
+            self._setDTRAndRTS(False, True) # IO0=HIGH & EN=LOW, chip in reset
             time.sleep(0.1)
-            self._setDTR(True)  # IO0=LOW
-            self._setRTS(False)  # EN=HIGH, chip out of reset
+            self._setDTRAndRTS(True, False) # IO0=LOW & # EN=HIGH, chip out of reset
             time.sleep(delay)
-            self._setDTR(False)  # IO0=HIGH, done
+            self._setDTRAndRTS(False, False) # IO0=HIGH, done
 
     def _connect_attempt(
         self, mode="default_reset", usb_jtag_serial=False, extra_delay=False
@@ -726,12 +727,12 @@ class ESPLoader(object):
         """Start downloading an application image to RAM"""
         # check we're not going to overwrite a running stub with this data
         if self.IS_STUB:
-            stub = StubFlasher(get_stub_json_path(self.CHIP_NAME))
+            stub = self.STUB_CODE
             load_start = offset
             load_end = offset + size
             for (start, end) in [
-                (stub.data_start, stub.data_start + len(stub.data)),
-                (stub.text_start, stub.text_start + len(stub.text)),
+                (stub["data_start"], stub["data_start"] + len(stub["data"])),
+                (stub["text_start"], stub["text_start"] + len(stub["text"])),
             ]:
                 if load_start < end and load_end > start:
                     raise FatalError(
@@ -804,51 +805,29 @@ class ESPLoader(object):
         return num_blocks
 
     def flash_block(self, data, seq, timeout=DEFAULT_TIMEOUT):
-        """Write block to flash, retry if fail"""
-        for attempts_left in range(WRITE_BLOCK_ATTEMPTS - 1, -1, -1):
-            try:
-                self.check_command(
-                    "write to target Flash after seq %d" % seq,
-                    self.ESP_FLASH_DATA,
-                    struct.pack("<IIII", len(data), seq, 0, 0) + data,
-                    self.checksum(data),
-                    timeout=timeout,
-                )
-                break
-            except FatalError:
-                if attempts_left:
-                    self.trace(
-                        "Block write failed, "
-                        f"retrying with {attempts_left} attempts left"
-                    )
-                else:
-                    raise
+        """Write block to flash"""
+        self.check_command(
+            "write to target Flash after seq %d" % seq,
+            self.ESP_FLASH_DATA,
+            struct.pack("<IIII", len(data), seq, 0, 0) + data,
+            self.checksum(data),
+            timeout=timeout,
+        )
 
     def flash_encrypt_block(self, data, seq, timeout=DEFAULT_TIMEOUT):
-        """Encrypt, write block to flash, retry if fail"""
+        """Encrypt before writing to flash"""
         if self.SUPPORTS_ENCRYPTED_FLASH and not self.IS_STUB:
             # ROM support performs the encrypted writes via the normal write command,
             # triggered by flash_begin(begin_rom_encrypted=True)
             return self.flash_block(data, seq, timeout)
 
-        for attempts_left in range(WRITE_BLOCK_ATTEMPTS - 1, -1, -1):
-            try:
-                self.check_command(
-                    "Write encrypted to target Flash after seq %d" % seq,
-                    self.ESP_FLASH_ENCRYPT_DATA,
-                    struct.pack("<IIII", len(data), seq, 0, 0) + data,
-                    self.checksum(data),
-                    timeout=timeout,
-                )
-                break
-            except FatalError:
-                if attempts_left:
-                    self.trace(
-                        "Encrypted block write failed, "
-                        f"retrying with {attempts_left} attempts left"
-                    )
-                else:
-                    raise
+        self.check_command(
+            "Write encrypted to target Flash after seq %d" % seq,
+            self.ESP_FLASH_ENCRYPT_DATA,
+            struct.pack("<IIII", len(data), seq, 0, 0) + data,
+            self.checksum(data),
+            timeout=timeout,
+        )
 
     def flash_finish(self, reboot=False):
         """Leave flash mode and run/reboot"""
@@ -866,10 +845,6 @@ class ESPLoader(object):
         """Read SPI flash manufacturer and device id"""
         SPIFLASH_RDID = 0x9F
         return self.run_spiflash_command(SPIFLASH_RDID, b"", 24)
-
-    def flash_type(self):
-        """Read flash type bit field from eFuse. Returns 0, 1, None (not present)"""
-        return None  # not implemented for all chip targets
 
     def get_security_info(self):
         res = self.check_command("get security info", self.ESP_GET_SECURITY_INFO, b"")
@@ -904,9 +879,6 @@ class ESPLoader(object):
 
     @classmethod
     def parse_flash_freq_arg(cls, arg):
-        if arg is None:
-            # The encoding of the default flash frequency in FLASH_FREQUENCY is always 0
-            return 0
         try:
             return cls.FLASH_FREQUENCY[arg]
         except KeyError:
@@ -918,7 +890,7 @@ class ESPLoader(object):
 
     def run_stub(self, stub=None):
         if stub is None:
-            stub = StubFlasher(get_stub_json_path(self.CHIP_NAME))
+            stub = self.STUB_CODE
 
         if self.sync_stub_detected:
             print("Stub is already running. No upload is necessary.")
@@ -926,18 +898,18 @@ class ESPLoader(object):
 
         # Upload
         print("Uploading stub...")
-        for field in [stub.text, stub.data]:
-            if field is not None:
-                offs = stub.text_start if field == stub.text else stub.data_start
-                length = len(field)
+        for field in ["text", "data"]:
+            if field in stub:
+                offs = stub[field + "_start"]
+                length = len(stub[field])
                 blocks = (length + self.ESP_RAM_BLOCK - 1) // self.ESP_RAM_BLOCK
                 self.mem_begin(length, blocks, self.ESP_RAM_BLOCK, offs)
                 for seq in range(blocks):
                     from_offs = seq * self.ESP_RAM_BLOCK
                     to_offs = from_offs + self.ESP_RAM_BLOCK
-                    self.mem_block(field[from_offs:to_offs], seq)
+                    self.mem_block(stub[field][from_offs:to_offs], seq)
         print("Running stub...")
-        self.mem_finish(stub.entry)
+        self.mem_finish(stub["entry"])
 
         p = self.read()
         if p != b"OHAI":
@@ -989,25 +961,14 @@ class ESPLoader(object):
 
     @stub_and_esp32_function_only
     def flash_defl_block(self, data, seq, timeout=DEFAULT_TIMEOUT):
-        """Write block to flash, send compressed, retry if fail"""
-        for attempts_left in range(WRITE_BLOCK_ATTEMPTS - 1, -1, -1):
-            try:
-                self.check_command(
-                    "write compressed data to flash after seq %d" % seq,
-                    self.ESP_FLASH_DEFL_DATA,
-                    struct.pack("<IIII", len(data), seq, 0, 0) + data,
-                    self.checksum(data),
-                    timeout=timeout,
-                )
-                break
-            except FatalError:
-                if attempts_left:
-                    self.trace(
-                        "Compressed block write failed, "
-                        f"retrying with {attempts_left} attempts left"
-                    )
-                else:
-                    raise
+        """Write block to flash, send compressed"""
+        self.check_command(
+            "write compressed data to flash after seq %d" % seq,
+            self.ESP_FLASH_DEFL_DATA,
+            struct.pack("<IIII", len(data), seq, 0, 0) + data,
+            self.checksum(data),
+            timeout=timeout,
+        )
 
     @stub_and_esp32_function_only
     def flash_defl_finish(self, reboot=False):
@@ -1435,38 +1396,6 @@ def slip_reader(port, trace_function):
     Designed to avoid too many calls to serial.read(1), which can bog
     down on slow systems.
     """
-
-    def detect_panic_handler(input):
-        """
-        Checks the input bytes for panic handler messages.
-        Raises a FatalError if Guru Meditation or Fatal Exception is found, as both
-        of these are used between different ROM versions.
-        Tries to also parse the error cause (e.g. IllegalInstruction).
-        """
-
-        guru_meditation = (
-            rb"G?uru Meditation Error: (?:Core \d panic'ed \(([a-zA-Z]*)\))?"
-        )
-        fatal_exception = rb"F?atal exception \(\d+\): (?:([a-zA-Z]*)?.*epc)?"
-
-        # Search either for Guru Meditation or Fatal Exception
-        data = re.search(
-            rb"".join([rb"(?:", guru_meditation, rb"|", fatal_exception, rb")"]),
-            input,
-            re.DOTALL,
-        )
-        if data is not None:
-            msg = "Guru Meditation Error detected {}".format(
-                " ".join(
-                    [
-                        "({})".format(i.decode("utf-8"))
-                        for i in [data.group(1), data.group(2)]
-                        if i is not None
-                    ]
-                )
-            )
-            raise FatalError(msg)
-
     partial_packet = None
     in_escape = False
     successful_slip = False
@@ -1488,18 +1417,18 @@ def slip_reader(port, trace_function):
             raise FatalError(msg)
         trace_function("Read %d bytes: %s", len(read_bytes), HexFormatter(read_bytes))
         for b in read_bytes:
-            b = bytes([b])
+            if type(b) is int:
+                b = bytes([b])  # python 2/3 compat
+
             if partial_packet is None:  # waiting for packet header
                 if b == b"\xc0":
                     partial_packet = b""
                 else:
                     trace_function("Read invalid data: %s", HexFormatter(read_bytes))
-                    remaining_data = port.read(port.inWaiting())
                     trace_function(
                         "Remaining data in serial buffer: %s",
-                        HexFormatter(remaining_data),
+                        HexFormatter(port.read(port.inWaiting())),
                     )
-                    detect_panic_handler(read_bytes + remaining_data)
                     raise FatalError(
                         "Invalid head of packet (0x%s): "
                         "Possible serial noise or corruption." % hexify(b)
@@ -1512,12 +1441,10 @@ def slip_reader(port, trace_function):
                     partial_packet += b"\xdb"
                 else:
                     trace_function("Read invalid data: %s", HexFormatter(read_bytes))
-                    remaining_data = port.read(port.inWaiting())
                     trace_function(
                         "Remaining data in serial buffer: %s",
-                        HexFormatter(remaining_data),
+                        HexFormatter(port.read(port.inWaiting())),
                     )
-                    detect_panic_handler(read_bytes + remaining_data)
                     raise FatalError("Invalid SLIP escape (0xdb, 0x%s)" % (hexify(b)))
             elif b == b"\xdb":  # start of escape sequence
                 in_escape = True
